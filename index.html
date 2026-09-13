@@ -9380,6 +9380,7 @@ function remindersCardHTML(){
   return `
   <div class="card">
     <h3 style="margin-top:0;"><i class="fa-solid fa-bell" style="color:var(--brand-primary);"></i> Medicine reminder / scheduler</h3>
+    ${medReminderNotifBannerHTML()}
     <div class="grid-2">
       <div class="form-group"><label>Medicine</label><input class="form-control" id="rem-med" placeholder="e.g. Metformin 500mg"></div>
       <div class="form-group"><label>Time</label><input type="time" class="form-control" id="rem-time"></div>
@@ -9472,6 +9473,94 @@ function medsSafetyCheckHTML(reminders){
     <ul>${warnings.map(w=>`<li style="${w.level==='danger'?'color:var(--brand-danger);font-weight:600;':''}">${w.text}</li>`).join('')}</ul>
     <p style="color:var(--text-muted);font-size:.76rem;margin:8px 0 0;">Automated keyword matching on what you typed in — not a clinical review. Always confirm with a pharmacist or doctor.</p>
   </div>`;
+}
+
+/* ============================================================
+   MEDICINE REMINDER CLOCK — reminders used to just store a time and
+   wait for a manual tap; nothing was ever watching the clock, so a
+   reminder never actually fired (no sound, no alert) and there was no
+   "enable notifications" option either. This adds both:
+     1) A once-a-minute check against every active reminder's time. On
+        a match it plays the notification sound, shows an on-screen
+        alert with quick Taken/Missed actions, and — if permission was
+        granted — a real browser Notification (so it can surface even
+        if ArogyaBot is in a background tab). Each reminder is only
+        fired once per day (r.lastFiredDate), same idea as the daily
+        taken/missed log it already keeps.
+     2) A visible "Enable notifications" banner/button using the
+        standard Notification API, since sound alone can be muted or
+        the tab backgrounded — the OS-level popup is the fallback.
+   ============================================================ */
+function medNotifSupported(){ return typeof window!=='undefined' && 'Notification' in window; }
+function medNotifPermission(){ return medNotifSupported() ? Notification.permission : 'unsupported'; }
+function requestMedReminderNotifPermission(){
+  if(!medNotifSupported()){ showToast('Not supported', 'This browser does not support notifications — the in-app sound and alert will still work.', 'warning'); return; }
+  Notification.requestPermission().then(perm=>{
+    if(perm==='granted') showToast('Notifications enabled', 'You\'ll get an alert here even if this tab is in the background.', 'success');
+    else if(perm==='denied') showToast('Notifications blocked', 'Turn them on for this site in your browser settings if you change your mind.', 'warning');
+    if(currentView==='p-pharmacy' || currentView==='p-meds') renderCurrentView(currentView);
+  }).catch(()=>{});
+}
+function medReminderNotifBannerHTML(){
+  const perm = medNotifPermission();
+  if(perm==='granted') return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;color:var(--brand-primary);font-size:.82rem;"><i class="fa-solid fa-circle-check"></i> Notifications enabled — you'll be alerted with a sound when a dose is due.</div>`;
+  if(perm==='unsupported') return '';
+  const blocked = perm==='denied';
+  return `<div class="reminder-row" style="background:rgba(13,148,136,.08);border:1px solid rgba(13,148,136,.3);border-radius:10px;padding:10px 12px;margin-bottom:14px;">
+    <div style="font-size:.82rem;"><i class="fa-solid fa-bell" style="color:var(--brand-primary);"></i> ${blocked ? 'Notifications are blocked for this site — enable them in your browser\'s site settings to get dose alerts.' : 'Turn on notifications so a reminder can alert you with a sound at dose time.'}</div>
+    ${blocked ? '' : `<button class="btn btn-sm" onclick="requestMedReminderNotifPermission()"><i class="fa-solid fa-bell"></i> Enable notifications</button>`}
+  </div>`;
+}
+// Fires a single reminder: sound + browser Notification (if granted) + an
+// on-screen alert with quick Taken/Missed buttons. Doesn't force the modal
+// open if the person is already in the middle of something else in one —
+// the sound + toast still land either way.
+function fireMedicineReminder(r){
+  playNotificationSound('danger');
+  showToast('Time for your medicine', r.med+' — due now ('+r.time+').', 'danger');
+  if(medNotifPermission()==='granted'){
+    try{
+      const n = new Notification('Medicine reminder — ArogyaBot', {body: 'Time to take '+r.med, tag:'medrem-'+r.id});
+      n.onclick = ()=>{ window.focus(); n.close(); };
+    }catch(e){ console.warn('Browser notification failed', e); }
+  }
+  const overlay = document.getElementById('modal-overlay');
+  if(overlay && overlay.classList.contains('hidden')){
+    openModal(`
+      <button class="modal-close-x" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button>
+      <h3 style="margin-top:0;"><i class="fa-solid fa-bell" style="color:var(--brand-danger);"></i> Time for your medicine</h3>
+      <p class="modal-sub">${attr(r.med)} — scheduled for ${r.time}.</p>
+      <div style="display:flex;gap:8px;">
+        <button class="btn" onclick="logDose('${r.id}','taken');closeModal();"><i class="fa-solid fa-check"></i> Taken</button>
+        <button class="btn btn-secondary" onclick="logDose('${r.id}','missed');closeModal();"><i class="fa-solid fa-xmark"></i> Missed</button>
+      </div>`);
+  }
+}
+function checkMedicineReminders(){
+  if(currentRole!=='patient') return;
+  const all = db('reminders')||[];
+  const mine = all.filter(r=>r.ownerId===currentPatientId() && r.on);
+  if(!mine.length) return;
+  const d = new Date();
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mm = String(d.getMinutes()).padStart(2,'0');
+  const nowHM = hh+':'+mm;
+  const today = todayKey();
+  let changed = false;
+  mine.forEach(r=>{
+    if(r.time===nowHM && r.lastFiredDate!==today){
+      r.lastFiredDate = today;
+      changed = true;
+      fireMedicineReminder(r);
+    }
+  });
+  if(changed) dbSet('reminders', all);
+}
+let MED_REMINDER_CLOCK = null;
+function startMedicineReminderClock(){
+  if(MED_REMINDER_CLOCK) return;
+  checkMedicineReminders();
+  MED_REMINDER_CLOCK = setInterval(checkMedicineReminders, 20000);
 }
 
 /* ============================================================
@@ -10980,6 +11069,10 @@ window.addEventListener('hashchange', checkSecretHashRoute);
 /* ============================================================
    BOOTSTRAP
    ============================================================ */
+// Runs once at load; checkMedicineReminders() itself no-ops until a patient
+// session is actually active, so it's safe to start unconditionally here
+// rather than hunting down every login/session-restore path.
+startMedicineReminderClock();
 (async function boot(){
   // Wait for Firebase Auth to finish restoring its persisted session (or confirm
   // there isn't one) BEFORE touching Firestore at all. Skipping this used to let
