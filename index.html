@@ -9387,6 +9387,10 @@ function remindersCardHTML(){
       <div class="form-group" style="grid-column:1/-1;"><label>Days of supply on hand (optional)</label><input type="number" min="1" class="form-control" id="rem-days" placeholder="e.g. 30 — so we can warn you before you run out"></div>
     </div>
     <button class="btn" onclick="addReminder()"><i class="fa-solid fa-plus"></i> Add reminder</button>
+    <details style="margin-top:14px;">
+      <summary style="cursor:pointer;font-size:.84rem;color:var(--text-muted);"><i class="fa-solid fa-music"></i> Alarm sound settings</summary>
+      ${medAlarmSoundSettingsHTML()}
+    </details>
   </div>
   ${medsSafetyCheckHTML(reminders)}
   <div class="card">
@@ -9479,17 +9483,21 @@ function medsSafetyCheckHTML(reminders){
    MEDICINE REMINDER CLOCK — reminders used to just store a time and
    wait for a manual tap; nothing was ever watching the clock, so a
    reminder never actually fired (no sound, no alert) and there was no
-   "enable notifications" option either. This adds both:
-     1) A once-a-minute check against every active reminder's time. On
-        a match it plays the notification sound, shows an on-screen
-        alert with quick Taken/Missed actions, and — if permission was
-        granted — a real browser Notification (so it can surface even
-        if ArogyaBot is in a background tab). Each reminder is only
-        fired once per day (r.lastFiredDate), same idea as the daily
-        taken/missed log it already keeps.
-     2) A visible "Enable notifications" banner/button using the
-        standard Notification API, since sound alone can be muted or
-        the tab backgrounded — the OS-level popup is the fallback.
+   "enable notifications" option either. This adds:
+     1) A clock that checks every active reminder's time each tick and,
+        on a match, RINGS like an alarm — sound repeats + vibration
+        repeats + a forced on-screen dialog — until the person Takes,
+        Marks missed, or Snoozes it, not just a single beep that's easy
+        to sleep through. Each reminder still only triggers once per
+        day (r.lastFiredDate) unless snoozed.
+     2) A real browser Notification (if permission was granted) so it
+        can surface even if ArogyaBot is a background tab.
+     3) A per-reminder custom alarm sound: the person can upload their
+        own short audio clip instead of the built-in synthesized tone.
+        This is scoped to medicine reminders only (separate storage
+        key from the global notification-sound settings) so emergency/
+        SOS alerts elsewhere in the app keep their distinct, always-
+        recognizable tones regardless of what's uploaded here.
    ============================================================ */
 function medNotifSupported(){ return typeof window!=='undefined' && 'Notification' in window; }
 function medNotifPermission(){ return medNotifSupported() ? Notification.permission : 'unsupported'; }
@@ -9511,30 +9519,127 @@ function medReminderNotifBannerHTML(){
     ${blocked ? '' : `<button class="btn btn-sm" onclick="requestMedReminderNotifPermission()"><i class="fa-solid fa-bell"></i> Enable notifications</button>`}
   </div>`;
 }
-// Fires a single reminder: sound + browser Notification (if granted) + an
-// on-screen alert with quick Taken/Missed buttons. Doesn't force the modal
-// open if the person is already in the middle of something else in one —
-// the sound + toast still land either way.
+
+// ---- Custom alarm sound upload (medicine reminders only) ----
+function hasMedAlarmSound(){ try{ return !!localStorage.getItem('abot2_medAlarmSoundData'); }catch(e){ return false; } }
+function getMedAlarmSoundName(){ try{ return localStorage.getItem('abot2_medAlarmSoundName')||'Custom sound'; }catch(e){ return 'Custom sound'; } }
+let __medAlarmAudioEl = null;
+function playMedAlarmSound(){
+  if(isSoundMuted()) return false;
+  let data = null;
+  try{ data = localStorage.getItem('abot2_medAlarmSoundData'); }catch(e){}
+  if(!data) return false;
+  try{
+    if(!__medAlarmAudioEl) __medAlarmAudioEl = new Audio();
+    __medAlarmAudioEl.pause();
+    __medAlarmAudioEl.currentTime = 0;
+    __medAlarmAudioEl.src = data;
+    __medAlarmAudioEl.volume = Math.min(1, getSoundVolume());
+    __medAlarmAudioEl.play().catch(()=>{});
+    return true;
+  }catch(e){ console.warn('Medicine alarm sound failed', e); return false; }
+}
+// One "ring" — the custom clip if uploaded, otherwise the same urgent tone
+// used for danger notifications elsewhere.
+function playMedicineAlarmTick(){ if(!playMedAlarmSound()) playNotificationSound('danger'); }
+function previewMedAlarmSound(e){ if(e) e.stopPropagation(); playMedicineAlarmTick(); }
+function handleMedAlarmSoundUpload(input){
+  const file = input.files && input.files[0];
+  if(!file) return;
+  if(!file.type.startsWith('audio/')){ showToast('Not an audio file', 'Please choose an audio file (mp3, wav, ogg…).', 'danger'); input.value=''; return; }
+  const MAX = 500*1024;
+  if(file.size > MAX){ showToast('File too large', 'Please choose a clip under 500KB so it can be saved on this device.', 'danger'); input.value=''; return; }
+  const reader = new FileReader();
+  reader.onload = ()=>{
+    try{
+      localStorage.setItem('abot2_medAlarmSoundData', reader.result);
+      localStorage.setItem('abot2_medAlarmSoundName', file.name);
+      showToast('Alarm sound saved', file.name+' will now play when a dose is due.', 'success');
+      renderCurrentView(currentView);
+    }catch(e){ showToast('Could not save', 'Your browser storage may be full — try a smaller clip.', 'danger'); }
+  };
+  reader.onerror = ()=> showToast('Upload failed', 'Could not read that file.', 'danger');
+  reader.readAsDataURL(file);
+}
+function removeMedAlarmSound(e){
+  if(e) e.stopPropagation();
+  try{ localStorage.removeItem('abot2_medAlarmSoundData'); localStorage.removeItem('abot2_medAlarmSoundName'); }catch(e){}
+  showToast('Removed', 'Back to the default alert tone.', 'info');
+  renderCurrentView(currentView);
+}
+function medAlarmSoundSettingsHTML(){
+  const has = hasMedAlarmSound();
+  return `<div class="form-group" style="margin-top:8px;">
+    <label>Upload a custom alarm sound</label>
+    <input type="file" accept="audio/*" class="form-control" onchange="handleMedAlarmSoundUpload(this)">
+    <div style="display:flex;align-items:center;gap:8px;margin-top:6px;font-size:.78rem;color:var(--text-muted);flex-wrap:wrap;">
+      ${has ? `<span><i class="fa-solid fa-file-audio"></i> ${attr(getMedAlarmSoundName())}</span>
+        <button class="btn btn-sm btn-secondary" onclick="previewMedAlarmSound(event)"><i class="fa-solid fa-play"></i> Test</button>
+        <button class="btn btn-sm btn-secondary" onclick="removeMedAlarmSound(event)"><i class="fa-solid fa-trash"></i> Remove</button>`
+        : `Using the default alert tone — upload a short clip (under 500KB) to use your own instead.`}
+    </div>
+  </div>`;
+}
+
+// ---- The alarm itself: rings (sound + vibration, repeating) and forces a
+// dialog until dismissed, instead of a single beep that's easy to miss.
+// If more than one reminder is due at once, they ring one at a time.
+let ringingAlarm = null; // {id, med, time, soundTimer, vibTimer}
+let alarmQueue = [];
 function fireMedicineReminder(r){
-  playNotificationSound('danger');
-  showToast('Time for your medicine', r.med+' — due now ('+r.time+').', 'danger');
+  alarmQueue.push(r);
+  if(!ringingAlarm) advanceAlarmQueue();
+}
+function advanceAlarmQueue(){
+  if(!alarmQueue.length){ ringingAlarm = null; return; }
+  startRingingAlarm(alarmQueue.shift());
+}
+function startRingingAlarm(r){
+  ringingAlarm = {id:r.id, med:r.med, time:r.time};
+  playMedicineAlarmTick();
+  ringingAlarm.soundTimer = setInterval(playMedicineAlarmTick, 2500);
+  if(navigator.vibrate){
+    navigator.vibrate([400,200,400]);
+    ringingAlarm.vibTimer = setInterval(()=>navigator.vibrate([400,200,400]), 2500);
+  }
   if(medNotifPermission()==='granted'){
     try{
       const n = new Notification('Medicine reminder — ArogyaBot', {body: 'Time to take '+r.med, tag:'medrem-'+r.id});
       n.onclick = ()=>{ window.focus(); n.close(); };
     }catch(e){ console.warn('Browser notification failed', e); }
   }
-  const overlay = document.getElementById('modal-overlay');
-  if(overlay && overlay.classList.contains('hidden')){
-    openModal(`
-      <button class="modal-close-x" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button>
-      <h3 style="margin-top:0;"><i class="fa-solid fa-bell" style="color:var(--brand-danger);"></i> Time for your medicine</h3>
-      <p class="modal-sub">${attr(r.med)} — scheduled for ${r.time}.</p>
-      <div style="display:flex;gap:8px;">
-        <button class="btn" onclick="logDose('${r.id}','taken');closeModal();"><i class="fa-solid fa-check"></i> Taken</button>
-        <button class="btn btn-secondary" onclick="logDose('${r.id}','missed');closeModal();"><i class="fa-solid fa-xmark"></i> Missed</button>
-      </div>`);
-  }
+  // An alarm should interrupt, so this replaces whatever else is in the modal.
+  openModal(`
+    <h3 style="margin-top:0;"><i class="fa-solid fa-bell" style="color:var(--brand-danger);"></i> Time for your medicine</h3>
+    <p class="modal-sub">${attr(r.med)} — scheduled for ${r.time}. Ringing until you respond.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn" onclick="dismissAlarm('taken')"><i class="fa-solid fa-check"></i> Taken</button>
+      <button class="btn btn-secondary" onclick="dismissAlarm('missed')"><i class="fa-solid fa-xmark"></i> Missed</button>
+      <button class="btn btn-secondary" onclick="dismissAlarm('snooze')"><i class="fa-solid fa-clock"></i> Snooze 5 min</button>
+    </div>`);
+}
+function stopRingingAlarm(){
+  if(!ringingAlarm) return;
+  clearInterval(ringingAlarm.soundTimer);
+  if(ringingAlarm.vibTimer) clearInterval(ringingAlarm.vibTimer);
+  if(navigator.vibrate) navigator.vibrate(0);
+}
+function dismissAlarm(action){
+  if(!ringingAlarm) return;
+  const id = ringingAlarm.id;
+  stopRingingAlarm();
+  closeModal();
+  if(action==='taken' || action==='missed') logDose(id, action);
+  else if(action==='snooze') snoozeReminder(id);
+  advanceAlarmQueue();
+}
+function snoozeReminder(id){
+  const all = db('reminders')||[];
+  const item = all.find(x=>x.id===id);
+  if(!item) return;
+  item.snoozeUntil = Date.now()+5*60000;
+  dbSet('reminders', all);
+  showToast('Snoozed', item.med+' — reminding again in 5 minutes.', 'info');
 }
 function checkMedicineReminders(){
   if(currentRole!=='patient') return;
@@ -9542,12 +9647,18 @@ function checkMedicineReminders(){
   const mine = all.filter(r=>r.ownerId===currentPatientId() && r.on);
   if(!mine.length) return;
   const d = new Date();
-  const hh = String(d.getHours()).padStart(2,'0');
-  const mm = String(d.getMinutes()).padStart(2,'0');
-  const nowHM = hh+':'+mm;
+  const nowHM = String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
   const today = todayKey();
+  const nowMs = Date.now();
   let changed = false;
   mine.forEach(r=>{
+    if(r.snoozeUntil && nowMs>=r.snoozeUntil){
+      delete r.snoozeUntil;
+      r.lastFiredDate = today;
+      changed = true;
+      fireMedicineReminder(r);
+      return;
+    }
     if(r.time===nowHM && r.lastFiredDate!==today){
       r.lastFiredDate = today;
       changed = true;
